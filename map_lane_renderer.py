@@ -56,7 +56,7 @@ def fetch_osm_chunks(bbox, grid_size):
             );
             out body;
             >;
-            out skel qt;"""
+            out body qt;""" # <-- skel yerine body yapıldı
 
             print(f"[AG] İndiriliyor: Parça {current_chunk}/{total_chunks}...")
             
@@ -152,7 +152,33 @@ def draw_dashed_polyline(surface, color, points, dash_len, space_len, width=1):
             end = min(curr + dash_len, seg_dist)
             pygame.draw.line(surface, color, (p1[0] + ux * curr, p1[1] + uy * curr), (p1[0] + ux * end, p1[1] + uy * end), width)
             curr += dash_len + space_len
+def draw_zebra_crossing(surface, scr_pt, ux, uy, road_width_px, px_per_meter):
+    # Yolun gidiş yönüne (ux, uy) 90 derece dik olan normal vektörünü bul (nx, ny)
+    nx, ny = -uy, ux
+    
+    # Zebra şeritlerinin boyutları (Dünya standartlarında ~3m uzunluk, 0.5m genişlik)
+    stripe_len = max(2, int(3.0 * px_per_meter))
+    stripe_w = max(1, int(0.5 * px_per_meter))
+    gap_w = max(1, int(0.5 * px_per_meter))
 
+    # Çizime yolun bir kenarından başla
+    half_w = road_width_px / 2.0
+    start_x = scr_pt[0] - nx * half_w
+    start_y = scr_pt[1] - ny * half_w
+
+    curr = 0
+    # Yolun genişliği boyunca şeritleri aralıklarla diz
+    while curr < road_width_px:
+        c_x = start_x + nx * curr
+        c_y = start_y + ny * curr
+
+        s_x1 = c_x - ux * (stripe_len / 2)
+        s_y1 = c_y - uy * (stripe_len / 2)
+        s_x2 = c_x + ux * (stripe_len / 2)
+        s_y2 = c_y + uy * (stripe_len / 2)
+
+        pygame.draw.line(surface, (230, 235, 240), (s_x1, s_y1), (s_x2, s_y2), stripe_w)
+        curr += (stripe_w + gap_w)
 def get_int(val, default=0):
     try: return int(val)
     except (TypeError, ValueError): return default
@@ -165,13 +191,18 @@ def parse_osm_chunks(chunk_files, projector):
     seen_ways = set() # Mükerrer (kesişen) binaları/yolları engellemek için
     
     LANE_WIDTH_WORLD = 3.5 * projector.units_per_meter
-    
+    crossings = set()
     for filename in chunk_files:
         with open(filename, "r", encoding="utf-8") as f:
             data = json.load(f)
             
         nodes = {elem["id"]: (elem["lat"], elem["lon"]) for elem in data.get("elements", []) if elem["type"] == "node"}
-        
+        # 1. Aşama: Yaya geçidi noktalarının ID'lerini topla
+        for elem in data.get("elements", []):
+            if elem["type"] == "node" and elem.get("tags", {}).get("highway") == "crossing":
+                crossings.add(elem["id"])
+                
+        # 2. Aşama: Yolları ve Binaları İşle
         for elem in data.get("elements", []):
             if elem["type"] == "way":
                 way_id = elem["id"]
@@ -240,11 +271,31 @@ def parse_osm_chunks(chunk_files, projector):
                                     elif lanes % 2 != 0 and lane_idx == lanes // 2: is_center = True
                                 dividers.append({"pts": div_pts, "is_center": is_center})
 
+                    # YENİ: Yol üzerindeki yaya geçitlerinin yönünü ve konumunu hesapla
+                    road_crossings = []
+                    node_ids = elem.get("nodes", [])
+                    for i, nid in enumerate(node_ids):
+                        if nid in crossings:
+                            p_curr = points[i]
+                            # Yolun o anki teğet yönünü (vektörünü) bul
+                            if i < len(points) - 1:
+                                dx, dy = points[i+1][0] - p_curr[0], points[i+1][1] - p_curr[1]
+                            elif i > 0:
+                                dx, dy = p_curr[0] - points[i-1][0], p_curr[1] - points[i-1][1]
+                            else:
+                                dx, dy = 1, 0
+                                
+                            length = math.hypot(dx, dy)
+                            if length > 0:
+                                road_crossings.append({"pt": p_curr, "dir": (dx/length, dy/length)})
+
+                    # append kısmına "crossings" eklendi
                     roads.append({
                         "body": points, "left": left_border, "right": right_border, "dividers": dividers,
                         "lanes": lanes, "type": hw_type, "width": total_w,
                         "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys),
-                        "is_bridge": is_bridge, "is_tunnel": is_tunnel, "z_index": z_index
+                        "is_bridge": is_bridge, "is_tunnel": is_tunnel, "z_index": z_index,
+                        "crossings": road_crossings # <--- EKLENDİ
                     })
 
     print(f"[SİSTEM] Başarıyla Birleştirildi! Toplam: {len(roads)} Yol, {len(buildings)} Bina.")
@@ -372,6 +423,13 @@ def main():
                             c_color = (80, 85, 90) if is_tunnel else (200, 205, 210)
                             dash_px, space_px, l_width = max(4.0, 3.0 * px_per_meter), max(4.0, 3.0 * px_per_meter), max(1, int(0.15 * px_per_meter))
                             draw_dashed_polyline(screen, c_color, scr_div, dash_px, space_px, l_width)
+            # --- 5. YAYA GEÇİTLERİ (Zebra Crossings - Sadece çok yakından görünür) ---
+            if zoom > 15.0:
+                for cx in road.get("crossings", []):
+                    # Ekran koordinatına çevir
+                    scr_pt = to_screen([cx["pt"]])[0]
+                    # Yaya geçidi fonksiyonunu çağır
+                    draw_zebra_crossing(screen, scr_pt, cx["dir"][0], cx["dir"][1], scaled_width, px_per_meter)
 
         # Bilgi Ekranı
         font = pygame.font.SysFont("Consolas", 14)
