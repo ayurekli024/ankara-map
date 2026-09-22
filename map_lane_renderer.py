@@ -219,10 +219,16 @@ def parse_osm_chunks(chunk_files, projector):
                 xs = [p[0] for p in points]
                 ys = [p[1] for p in points]
 
-                # BİNA İŞLEME
+                # BİNA İŞLEME (3D İçin Güncellendi)
                 if "building" in tags:
                     if len(points) >= 3:
                         b_type = tags.get("building", "yes")
+                        
+                        # YENİ: 3D Yükseklik Verisi Çıkarımı
+                        # Kat sayısı belirtilmemişse varsayılan 1 kat (3 metre) alıyoruz.
+                        levels = get_int(tags.get("building:levels", 1))
+                        height_meters = get_int(tags.get("height", levels * 3))
+                        
                         ind_tags = ["industrial", "commercial", "retail", "office", "warehouse", "manufacture"]
                         res_tags = ["residential", "apartments", "house", "dormitory", "terrace", "detached"]
                         
@@ -231,7 +237,10 @@ def parse_osm_chunks(chunk_files, projector):
                         elif b_type in res_tags: category = "residential"
 
                         buildings.append({
-                            "points": points, "category": category,
+                            "points": points, 
+                            "category": category,
+                            "levels": levels,            # 3D Motoru (Unity) için eklendi
+                            "height_m": height_meters,   # 3D Motoru (Unity) için eklendi
                             "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
                         })
 
@@ -239,6 +248,12 @@ def parse_osm_chunks(chunk_files, projector):
                 elif "highway" in tags:
                     hw_type = tags.get("highway")
                     if hw_type in ["footway", "pedestrian", "path", "steps", "cycleway"]: continue
+
+                    # --- YENİ: Toprak Yol / Yüzey Kontrolü ---
+                    surface = tags.get("surface", "unknown")
+                    unpaved_surfaces = ["dirt", "unpaved", "gravel", "earth", "ground", "sand", "grass", "mud", "compacted"]
+                    # Yol 'track' (patika/tarla yolu) ise veya yüzeyi asfaltsızsa toprak yol kabul et
+                    is_unpaved = (hw_type == "track") or (surface in unpaved_surfaces)
 
                     is_oneway = tags.get("oneway") in ["yes", "1", "true"]
                     lanes = get_int(tags.get("lanes:forward", 0)) + get_int(tags.get("lanes:backward", 0))
@@ -258,9 +273,15 @@ def parse_osm_chunks(chunk_files, projector):
                     half_w = total_w / 2.0
                     left_border = offset_polyline(points, -half_w)
                     right_border = offset_polyline(points, half_w)
+                    # Toprak yollar genellikle daha dardır, görsel olarak şerit genişliğini kısıyoruz
+                    world_lane_w = (2.5 if is_unpaved else 3.5) * projector.units_per_meter
+                    total_w = lanes * world_lane_w
+                    half_w = total_w / 2.0
+                    left_border = offset_polyline(points, -half_w)
+                    right_border = offset_polyline(points, half_w)
                     
                     dividers = []
-                    if lanes > 1:
+                    if lanes > 1 and not is_unpaved:
                         for lane_idx in range(1, lanes):
                             offset = -half_w + (lane_idx * LANE_WIDTH_WORLD)
                             div_pts = offset_polyline(points, offset)
@@ -295,7 +316,8 @@ def parse_osm_chunks(chunk_files, projector):
                         "lanes": lanes, "type": hw_type, "width": total_w,
                         "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys),
                         "is_bridge": is_bridge, "is_tunnel": is_tunnel, "z_index": z_index,
-                        "crossings": road_crossings # <--- EKLENDİ
+                        "crossings": road_crossings ,
+                        "is_unpaved": is_unpaved# <--- EKLENDİ
                     })
 
     print(f"[SİSTEM] Başarıyla Birleştirildi! Toplam: {len(roads)} Yol, {len(buildings)} Bina.")
@@ -395,9 +417,12 @@ def main():
             if len(scr_body) < 2: continue
 
             is_bridge, is_tunnel = road.get("is_bridge", False), road.get("is_tunnel", False)
+            is_unpaved = road.get("is_unpaved", False)
             asphalt_color = (20, 22, 24) if is_tunnel else (55, 58, 64)
             border_color = (40, 45, 50) if is_tunnel else (100, 105, 115)
-
+            if is_unpaved:
+                asphalt_color = (130, 115, 95)  # Toprak / Kum Rengi
+                border_color = (100, 85, 65)    # Koyu Toprak Kenarlıkları
             if is_bridge and zoom > 10.0:
                 shadow_body = [((x + camera_x) * zoom + 5, (y + camera_y) * zoom + 5) for x, y in road["body"]]
                 pygame.draw.lines(screen, (15, 16, 18), False, shadow_body, max(1, int(scaled_width)))
@@ -406,12 +431,12 @@ def main():
                 pygame.draw.lines(screen, (150, 155, 160), False, scr_body, max(1, int(scaled_width + (1.0 * px_per_meter))))
 
             pygame.draw.lines(screen, asphalt_color, False, scr_body, max(1, int(scaled_width)))
-
+            
             if zoom > 5.0:
                 if len(road["left"]) >= 2: pygame.draw.lines(screen, border_color, False, to_screen(road["left"]), 1)
                 if len(road["right"]) >= 2: pygame.draw.lines(screen, border_color, False, to_screen(road["right"]), 1)
 
-                if road["type"] not in ["residential", "unclassified", "living_street", "service"]:
+                if road["type"] not in ["residential", "unclassified", "living_street", "service"] and not is_unpaved:
                     for div in road["dividers"]:
                         scr_div = to_screen(div["pts"])
                         if div["is_center"]:
