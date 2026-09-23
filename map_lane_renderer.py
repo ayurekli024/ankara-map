@@ -183,158 +183,347 @@ def get_int(val, default=0):
     try: return int(val)
     except (TypeError, ValueError): return default
 
-# --- 2. PARÇALI VERİ AYRIŞTIRICI VE TEKİLLEŞTİRME ---
+# --- GEOMETRİK YUMUŞATMA, KAVŞAK (Y-JUNCTION) VE TAPER MOTORU ---
+def generate_junctions_and_tapers(raw_roads, projector):
+    node_to_roads = {}
+    for idx, r in enumerate(raw_roads):
+        n_start = r["nodes"][0]
+        n_end = r["nodes"][-1]
+        node_to_roads.setdefault(n_start, []).append((idx, True))   # True: Başlangıç
+        node_to_roads.setdefault(n_end, []).append((idx, False))  # False: Bitiş
+
+    taper_plans = []
+    junction_polys = []
+
+    for nid, conns in node_to_roads.items():
+        # =========================================================================
+        # 1. DURUM: 3 veya Daha Fazla Yolun Birleştiği Kavşaklar (Y-Kavşak, Çatallanma)
+        # =========================================================================
+        if len(conns) >= 3:
+            # Düğüm noktasının koordinatını al
+            idx0, is_s0 = conns[0]
+            p_node = raw_roads[idx0]["points"][0] if is_s0 else raw_roads[idx0]["points"][-1]
+
+            max_w_at_node = max(raw_roads[idx]["width"] for idx, _ in conns)
+            mouth_corners = []
+
+            # Her yolu kavşak merkezinden dışarıya doğru geri çek (Setback)
+            for idx, is_start in conns:
+                r = raw_roads[idx]
+                pts = r["points"]
+                if len(pts) < 2:
+                    continue
+
+                p_curr = pts[0] if is_start else pts[-1]
+                p_next = pts[1] if is_start else pts[-2]
+
+                dx = p_next[0] - p_curr[0]
+                dy = p_next[1] - p_curr[1]
+                seg_len = math.hypot(dx, dy)
+                if seg_len < 1e-4:
+                    continue
+
+                ux, uy = dx / seg_len, dy / seg_len
+                # Geri çekilme mesafesi (Yolun genişliğine ve kavşaktaki en geniş yola orantılı)
+                setback = min(max(r["width"] * 0.75, max_w_at_node * 0.5), seg_len * 0.42)
+
+                p_cut = (p_curr[0] + ux * setback, p_curr[1] + uy * setback)
+
+                # Yolun uç noktasını geri çekilmiş noktaya sabitle (Şeritler kavşağa taşmaz!)
+                if is_start:
+                    pts[0] = p_cut
+                else:
+                    pts[-1] = p_cut
+
+                # Yol ağzındaki sol ve sağ köşe noktalarını hesapla
+                half_w = r["width"] / 2.0
+                nx, ny = -uy, ux  # Gidiş yönüne dik normal vektör
+
+                p_left = (p_cut[0] - nx * half_w, p_cut[1] - ny * half_w)
+                p_right = (p_cut[0] + nx * half_w, p_cut[1] + ny * half_w)
+
+                mouth_corners.append({"pt": p_left, "road_idx": idx, "side": "left"})
+                mouth_corners.append({"pt": p_right, "road_idx": idx, "side": "right"})
+
+            if len(mouth_corners) >= 6:
+                # Köşeleri kavşak merkezine göre açısal (saat yönünde) sırala
+                def get_angle(c):
+                    return math.atan2(c["pt"][1] - p_node[1], c["pt"][0] - p_node[0])
+
+                sorted_corners = sorted(mouth_corners, key=get_angle)
+                poly_pts = [c["pt"] for c in sorted_corners]
+
+                # Kaldırım/Bordür kenarlarını belirle:
+                # İki nokta AYNI yola aitse orası yolun açık ağzıdır (çizgi çekilmez).
+                # İki nokta FARKLI yollara aitse orası iki yol arasındaki kaldırımdır (çizgi çekilir).
+                curb_lines = []
+                n_pts = len(sorted_corners)
+                for i in range(n_pts):
+                    c1 = sorted_corners[i]
+                    c2 = sorted_corners[(i + 1) % n_pts]
+                    if c1["road_idx"] != c2["road_idx"]:
+                        curb_lines.append((c1["pt"], c2["pt"]))
+
+                xs = [p[0] for p in poly_pts]
+                ys = [p[1] for p in poly_pts]
+
+                is_unpaved = any(raw_roads[idx].get("is_unpaved") for idx, _ in conns)
+                is_tunnel = all(raw_roads[idx].get("is_tunnel") for idx, _ in conns)
+                asphalt_color = (130, 115, 95) if is_unpaved else ((20, 22, 24) if is_tunnel else (55, 58, 64))
+                border_color = (100, 85, 65) if is_unpaved else ((40, 45, 50) if is_tunnel else (100, 105, 115))
+
+                junction_polys.append({
+                    "poly": poly_pts,
+                    "curbs": curb_lines,
+                    "asphalt_color": asphalt_color,
+                    "border_color": border_color,
+                    "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
+                })
+            continue
+
+        # =========================================================================
+        # 2. DURUM: 2 Yol Arasındaki Şerit Değişimi (Taper - Konik Genişleme)
+        # =========================================================================
+        if len(conns) == 2:
+            (idx1, is_start1), (idx2, is_start2) = conns
+            r1, r2 = raw_roads[idx1], raw_roads[idx2]
+
+            if r1["width"] != r2["width"]:
+                if r1["width"] > r2["width"]:
+                    r_wide, is_start_w, r_narrow, is_start_n = r1, is_start1, r2, is_start2
+                else:
+                    r_wide, is_start_w, r_narrow, is_start_n = r2, is_start2, r1, is_start1
+
+                pts_w = r_wide["points"]
+                if len(pts_w) < 2:
+                    continue
+
+                p_junc = pts_w[0] if is_start_w else pts_w[-1]
+                p_next = pts_w[1] if is_start_w else pts_w[-2]
+
+                dx = p_next[0] - p_junc[0]
+                dy = p_next[1] - p_junc[1]
+                seg_len = math.hypot(dx, dy)
+                if seg_len < 1e-4:
+                    continue
+
+                ux, uy = dx / seg_len, dy / seg_len
+                taper_dist = min(20.0 * projector.units_per_meter, seg_len * 0.45)
+                p_taper = (p_junc[0] + ux * taper_dist, p_junc[1] + uy * taper_dist)
+
+                if is_start_w:
+                    pts_w[0] = p_taper
+                else:
+                    pts_w[-1] = p_taper
+
+                taper_plans.append({
+                    "r_wide": r_wide, "is_start_w": is_start_w,
+                    "r_narrow": r_narrow, "is_start_n": is_start_n,
+                    "p_junc": p_junc, "p_taper": p_taper
+                })
+
+    return taper_plans, junction_polys
+
+
+# --- GÜNCELLENMİŞ PARÇALI VERİ AYRIŞTIRICI ---
 def parse_osm_chunks(chunk_files, projector):
     print("[SİSTEM] Tüm parçalar birleştiriliyor ve işleniyor...")
-    roads = []
+    raw_roads = []
     buildings = []
-    seen_ways = set() # Mükerrer (kesişen) binaları/yolları engellemek için
-    
-    LANE_WIDTH_WORLD = 3.5 * projector.units_per_meter
+    seen_ways = set()
     crossings = set()
+
     for filename in chunk_files:
         with open(filename, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
+
         nodes = {elem["id"]: (elem["lat"], elem["lon"]) for elem in data.get("elements", []) if elem["type"] == "node"}
-        # 1. Aşama: Yaya geçidi noktalarının ID'lerini topla
+
+        # 1. Yaya Geçitlerini Topla
         for elem in data.get("elements", []):
             if elem["type"] == "node" and elem.get("tags", {}).get("highway") == "crossing":
                 crossings.add(elem["id"])
-                
-        # 2. Aşama: Yolları ve Binaları İşle
+
+        # 2. Yolları ve Binaları Oku
         for elem in data.get("elements", []):
             if elem["type"] == "way":
                 way_id = elem["id"]
-                
-                # Sınır kesişmelerinde aynı bina/yol iki kere çizilmesin
                 if way_id in seen_ways:
                     continue
                 seen_ways.add(way_id)
-                
+
                 tags = elem.get("tags", {})
                 points = [projector.project(*nodes[nid]) for nid in elem.get("nodes", []) if nid in nodes]
-                if len(points) < 2: continue
-                    
+                if len(points) < 2:
+                    continue
+
                 xs = [p[0] for p in points]
                 ys = [p[1] for p in points]
 
-                # BİNA İŞLEME (3D İçin Güncellendi)
+                # BİNA İŞLEME
                 if "building" in tags:
                     if len(points) >= 3:
                         b_type = tags.get("building", "yes")
-                        
-                        # YENİ: 3D Yükseklik Verisi Çıkarımı
-                        # Kat sayısı belirtilmemişse varsayılan 1 kat (3 metre) alıyoruz.
                         levels = get_int(tags.get("building:levels", 1))
                         height_meters = get_int(tags.get("height", levels * 3))
-                        
+
                         ind_tags = ["industrial", "commercial", "retail", "office", "warehouse", "manufacture"]
                         res_tags = ["residential", "apartments", "house", "dormitory", "terrace", "detached"]
-                        
+
                         category = "default"
                         if b_type in ind_tags: category = "industrial"
                         elif b_type in res_tags: category = "residential"
 
                         buildings.append({
-                            "points": points, 
-                            "category": category,
-                            "levels": levels,            # 3D Motoru (Unity) için eklendi
-                            "height_m": height_meters,   # 3D Motoru (Unity) için eklendi
+                            "points": points, "category": category,
+                            "levels": levels, "height_m": height_meters,
                             "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
                         })
 
                 # YOL İŞLEME
                 elif "highway" in tags:
                     hw_type = tags.get("highway")
-                    if hw_type in ["footway", "pedestrian", "path", "steps", "cycleway"]: continue
+                    if hw_type in ["footway", "pedestrian", "path", "steps", "cycleway"]:
+                        continue
 
-                    # --- YENİ: Toprak Yol / Yüzey Kontrolü ---
                     surface = tags.get("surface", "unknown")
                     unpaved_surfaces = ["dirt", "unpaved", "gravel", "earth", "ground", "sand", "grass", "mud", "compacted"]
-                    # Yol 'track' (patika/tarla yolu) ise veya yüzeyi asfaltsızsa toprak yol kabul et
                     is_unpaved = (hw_type == "track") or (surface in unpaved_surfaces)
 
                     is_oneway = tags.get("oneway") in ["yes", "1", "true"]
                     lanes = get_int(tags.get("lanes:forward", 0)) + get_int(tags.get("lanes:backward", 0))
-                    
                     if lanes == 0:
                         lanes = get_int(tags.get("lanes", 0))
                         if lanes == 0:
-                            per_dir = {"motorway":3, "trunk":3, "primary":2, "secondary":2}.get(hw_type, 1)
+                            per_dir = {"motorway": 3, "trunk": 3, "primary": 2, "secondary": 2}.get(hw_type, 1)
                             lanes = per_dir if is_oneway else per_dir * 2
                     lanes = max(1, lanes)
-                    
+
                     is_bridge = tags.get("bridge") in ["yes", "true", "1", "viaduct"]
                     is_tunnel = tags.get("tunnel") in ["yes", "true", "1", "building_passage"]
                     z_index = 1 if is_bridge else (-1 if is_tunnel else 0)
-                    
-                    total_w = lanes * LANE_WIDTH_WORLD
-                    half_w = total_w / 2.0
-                    left_border = offset_polyline(points, -half_w)
-                    right_border = offset_polyline(points, half_w)
-                    # Toprak yollar genellikle daha dardır, görsel olarak şerit genişliğini kısıyoruz
+
                     world_lane_w = (2.5 if is_unpaved else 3.5) * projector.units_per_meter
                     total_w = lanes * world_lane_w
-                    half_w = total_w / 2.0
-                    left_border = offset_polyline(points, -half_w)
-                    right_border = offset_polyline(points, half_w)
-                    
-                    dividers = []
-                    if lanes > 1 and not is_unpaved:
-                        for lane_idx in range(1, lanes):
-                            offset = -half_w + (lane_idx * LANE_WIDTH_WORLD)
-                            div_pts = offset_polyline(points, offset)
-                            if len(div_pts) >= 2:
-                                is_center = False
-                                if not is_oneway:
-                                    if lanes % 2 == 0 and lane_idx == lanes // 2: is_center = True
-                                    elif lanes % 2 != 0 and lane_idx == lanes // 2: is_center = True
-                                dividers.append({"pts": div_pts, "is_center": is_center})
 
-                    # YENİ: Yol üzerindeki yaya geçitlerinin yönünü ve konumunu hesapla
-                    road_crossings = []
-                    node_ids = elem.get("nodes", [])
-                    for i, nid in enumerate(node_ids):
-                        if nid in crossings:
-                            p_curr = points[i]
-                            # Yolun o anki teğet yönünü (vektörünü) bul
-                            if i < len(points) - 1:
-                                dx, dy = points[i+1][0] - p_curr[0], points[i+1][1] - p_curr[1]
-                            elif i > 0:
-                                dx, dy = p_curr[0] - points[i-1][0], p_curr[1] - points[i-1][1]
-                            else:
-                                dx, dy = 1, 0
-                                
-                            length = math.hypot(dx, dy)
-                            if length > 0:
-                                road_crossings.append({"pt": p_curr, "dir": (dx/length, dy/length)})
-
-                    # append kısmına "crossings" eklendi
-                    roads.append({
-                        "body": points, "left": left_border, "right": right_border, "dividers": dividers,
-                        "lanes": lanes, "type": hw_type, "width": total_w,
-                        "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys),
-                        "is_bridge": is_bridge, "is_tunnel": is_tunnel, "z_index": z_index,
-                        "crossings": road_crossings ,
-                        "is_unpaved": is_unpaved# <--- EKLENDİ
+                    raw_roads.append({
+                        "points": points,
+                        "nodes": elem.get("nodes", []),
+                        "lanes": lanes,
+                        "width": total_w,
+                        "lane_w": world_lane_w,
+                        "type": hw_type,
+                        "is_oneway": is_oneway,
+                        "is_bridge": is_bridge,
+                        "is_tunnel": is_tunnel,
+                        "is_unpaved": is_unpaved,
+                        "z_index": z_index
                     })
 
-    print(f"[SİSTEM] Başarıyla Birleştirildi! Toplam: {len(roads)} Yol, {len(buildings)} Bina.")
-    return roads, buildings
+    # --- KAVŞAK VE TAPERLAR HESAPLANIYOR (Uçlar düzeltiliyor) ---
+    taper_plans, junction_polys = generate_junctions_and_tapers(raw_roads, projector)
 
-# --- ANA DÖNGÜ ---
+    # 3. Yolların Bordür ve Şeritlerini Hesapla (Trimlenmiş noktalar üzerinden!)
+    roads = []
+    for r in raw_roads:
+        pts = r["points"]
+        total_w = r["width"]
+        half_w = total_w / 2.0
+        world_lane_w = r["lane_w"]
+        lanes = r["lanes"]
+
+        left_border = offset_polyline(pts, -half_w)
+        right_border = offset_polyline(pts, half_w)
+
+        dividers = []
+        if lanes > 1 and not r["is_unpaved"]:
+            for lane_idx in range(1, lanes):
+                offset = -half_w + (lane_idx * world_lane_w)
+                div_pts = offset_polyline(pts, offset)
+                if len(div_pts) >= 2:
+                    is_center = False
+                    if not r["is_oneway"]:
+                        if lanes % 2 == 0 and lane_idx == lanes // 2: is_center = True
+                        elif lanes % 2 != 0 and lane_idx == lanes // 2: is_center = True
+                    dividers.append({"pts": div_pts, "is_center": is_center})
+
+        # Yaya geçitleri
+        road_crossings = []
+        node_ids = r["nodes"]
+        for i, nid in enumerate(node_ids):
+            if nid in crossings and i < len(pts):
+                p_curr = pts[i]
+                if i < len(pts) - 1:
+                    dx, dy = pts[i+1][0] - p_curr[0], pts[i+1][1] - p_curr[1]
+                elif i > 0:
+                    dx, dy = p_curr[0] - pts[i-1][0], p_curr[1] - pts[i-1][1]
+                else:
+                    dx, dy = 1, 0
+                length = math.hypot(dx, dy)
+                if length > 0:
+                    road_crossings.append({"pt": p_curr, "dir": (dx/length, dy/length)})
+
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+
+        r.update({
+            "body": pts, "left": left_border, "right": right_border, "dividers": dividers,
+            "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys),
+            "crossings": road_crossings
+        })
+        roads.append(r)
+
+    # 4. Taper Geometrilerini Bordür Noktalarına Mühürle
+    tapers = []
+    for plan in taper_plans:
+        r_w, is_s_w = plan["r_wide"], plan["is_start_w"]
+        r_n, is_s_n = plan["r_narrow"], plan["is_start_n"]
+
+        l_junc = r_n["left"][0 if is_s_n else -1]
+        r_junc = r_n["right"][0 if is_s_n else -1]
+
+        l_taper = r_w["left"][0 if is_s_w else -1]
+        r_taper = r_w["right"][0 if is_s_w else -1]
+
+        if math.hypot(l_junc[0] - l_taper[0], l_junc[1] - l_taper[1]) > math.hypot(l_junc[0] - r_taper[0], l_junc[1] - r_taper[1]):
+            l_taper, r_taper = r_taper, l_taper
+
+        poly = [l_junc, l_taper, r_taper, r_junc]
+        xs = [p[0] for p in poly]
+        ys = [p[1] for p in poly]
+
+        is_tunnel = r_w.get("is_tunnel", False)
+        is_unpaved = r_w.get("is_unpaved", False)
+        asphalt_color = (130, 115, 95) if is_unpaved else ((20, 22, 24) if is_tunnel else (55, 58, 64))
+        border_color = (100, 85, 65) if is_unpaved else ((40, 45, 50) if is_tunnel else (100, 105, 115))
+
+        has_center = (not r_w.get("is_oneway", True)) and (not r_n.get("is_oneway", True))
+
+        tapers.append({
+            "poly": poly,
+            "left": [l_junc, l_taper],
+            "right": [r_junc, r_taper],
+            "asphalt_color": asphalt_color,
+            "border_color": border_color,
+            "is_center": has_center,
+            "center_pts": [plan["p_junc"], plan["p_taper"]],
+            "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
+        })
+
+    print(f"[SİSTEM] {len(roads)} Yol, {len(junction_polys)} Kavşak Alanı, {len(tapers)} Taper, {len(buildings)} Bina hazır.")
+    return roads, buildings, tapers, junction_polys
+
+
+# --- ANA ÇİZİM DÖNGÜSÜ ---
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-    pygame.display.set_caption("ANKARA HARİTA RENDERER (OSM Verisi)")
+    pygame.display.set_caption("ANKARA HARİTA RENDERER (Pürüzsüz Kavşaklar & Çatallanmalar)")
     clock = pygame.time.Clock()
 
-    # Eski: roads, buildings = parse_osm_data(fetch_osm_data(BBOX), projector)
-    # YENİ ÇAĞIRMA BİÇİMİ:
     projector = MapProjector(BBOX, SCREEN_WIDTH, SCREEN_HEIGHT)
     chunk_files = fetch_osm_chunks(BBOX, GRID_SIZE)
-    roads, buildings = parse_osm_chunks(chunk_files, projector)
+    roads, buildings, tapers, junction_polys = parse_osm_chunks(chunk_files, projector)
     roads.sort(key=lambda r: (r.get("z_index", 0), r["lanes"]))
 
     camera_x, camera_y, zoom = 0.0, 0.0, 1.0
@@ -346,7 +535,8 @@ def main():
         mouse_pos = pygame.mouse.get_pos()
 
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: running = False
+            if event.type == pygame.QUIT:
+                running = False
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     is_dragging = True
@@ -356,7 +546,8 @@ def main():
                     world_x, world_y = (mouse_pos[0] / zoom) - camera_x, (mouse_pos[1] / zoom) - camera_y
                     zoom = max(0.1, min(zoom * zoom_factor, 1000.0))
                     camera_x, camera_y = (mouse_pos[0] / zoom) - world_x, (mouse_pos[1] / zoom) - world_y
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1: is_dragging = False
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                is_dragging = False
             elif event.type == pygame.MOUSEMOTION and is_dragging:
                 dx, dy = mouse_pos[0] - last_mouse_pos[0], mouse_pos[1] - last_mouse_pos[1]
                 camera_x += dx / zoom
@@ -367,62 +558,68 @@ def main():
         view_min_y, view_max_y = -camera_y, -camera_y + (SCREEN_HEIGHT / zoom)
 
         screen.fill((20, 22, 26))
-        
+
         def to_screen(pts):
             return [((x + camera_x) * zoom, (y + camera_y) * zoom) for x, y in pts]
-            
+
         px_per_meter = projector.units_per_meter * zoom
 
-        # --- 1. BİNALARI ÇİZ (En alt katman, yolların altında kalır) ---
-        buildings_drawn = 0
-        
-        # YENİ OPTİMİZASYON: Zoom seviyesi 10'un altındaysa bina döngüsüne HİÇ girme.
-        # Bu sayede oyun ilk yüklendiğinde yüz binlerce bina sorgusu atlanıp FPS korunur.
+        # 1. Binalar (En alt katman)
         if zoom > 10.0:
             for b in buildings:
-                # Culling: Bina kameranın görüş alanı (frustum) dışındaysa atla
                 if (b["max_x"] < view_min_x or b["min_x"] > view_max_x or
                     b["max_y"] < view_min_y or b["min_y"] > view_max_y):
                     continue
-                
                 scr_pts = to_screen(b["points"])
                 if len(scr_pts) > 2:
-                    # RENGİ BELİRLEME
                     if b["category"] == "industrial":
-                        color = (190, 110, 50)  
-                        border = (130, 70, 30)
+                        color, border = (190, 110, 50), (130, 70, 30)
                     elif b["category"] == "residential":
-                        color = (180, 185, 180) 
-                        border = (120, 125, 120)
+                        color, border = (180, 185, 180), (120, 125, 120)
                     else:
-                        color = (80, 85, 90)    
-                        border = (50, 55, 60)
+                        color, border = (80, 85, 90), (50, 55, 60)
 
                     pygame.draw.polygon(screen, color, scr_pts)
                     pygame.draw.polygon(screen, border, scr_pts, max(1, int(0.2 * px_per_meter)))
-                    buildings_drawn += 1
 
-        # --- 2. YOLLARI ÇİZ ---
+        # 2. Kavşak Alanları (Y-Kavşak ve Çatallanma Gövdeleri)
+        for junc in junction_polys:
+            if (junc["max_x"] < view_min_x or junc["min_x"] > view_max_x or
+                junc["max_y"] < view_min_y or junc["min_y"] > view_max_y):
+                continue
+            scr_poly = to_screen(junc["poly"])
+            if len(scr_poly) >= 3:
+                pygame.draw.polygon(screen, junc["asphalt_color"], scr_poly)
+
+        # 3. Konik Geçiş (Taper) Gövdeleri
+        for taper in tapers:
+            if (taper["max_x"] < view_min_x or taper["min_x"] > view_max_x or
+                taper["max_y"] < view_min_y or taper["min_y"] > view_max_y):
+                continue
+            scr_poly = to_screen(taper["poly"])
+            pygame.draw.polygon(screen, taper["asphalt_color"], scr_poly)
+
+        # 4. Yolların Asfalt Gövdeleri
         roads_drawn = 0
         for road in roads:
             if (road["max_x"] < view_min_x or road["min_x"] > view_max_x or
                 road["max_y"] < view_min_y or road["min_y"] > view_max_y):
                 continue
-                
-            if zoom < 0.4 and road["type"] in ["residential", "service", "unclassified"]: continue
+
+            if zoom < 0.4 and road["type"] in ["residential", "service", "unclassified"]:
+                continue
             roads_drawn += 1
 
             scaled_width = road["width"] * zoom
             scr_body = to_screen(road["body"])
-            if len(scr_body) < 2: continue
+            if len(scr_body) < 2:
+                continue
 
-            is_bridge, is_tunnel = road.get("is_bridge", False), road.get("is_tunnel", False)
+            is_bridge = road.get("is_bridge", False)
+            is_tunnel = road.get("is_tunnel", False)
             is_unpaved = road.get("is_unpaved", False)
-            asphalt_color = (20, 22, 24) if is_tunnel else (55, 58, 64)
-            border_color = (40, 45, 50) if is_tunnel else (100, 105, 115)
-            if is_unpaved:
-                asphalt_color = (130, 115, 95)  # Toprak / Kum Rengi
-                border_color = (100, 85, 65)    # Koyu Toprak Kenarlıkları
+            asphalt_color = (130, 115, 95) if is_unpaved else ((20, 22, 24) if is_tunnel else (55, 58, 64))
+
             if is_bridge and zoom > 10.0:
                 shadow_body = [((x + camera_x) * zoom + 5, (y + camera_y) * zoom + 5) for x, y in road["body"]]
                 pygame.draw.lines(screen, (15, 16, 18), False, shadow_body, max(1, int(scaled_width)))
@@ -431,8 +628,46 @@ def main():
                 pygame.draw.lines(screen, (150, 155, 160), False, scr_body, max(1, int(scaled_width + (1.0 * px_per_meter))))
 
             pygame.draw.lines(screen, asphalt_color, False, scr_body, max(1, int(scaled_width)))
-            
-            if zoom > 5.0:
+
+        # 5. Bordür Çizgileri ve Şeritler
+        if zoom > 5.0:
+            # Kavşak Bordürleri (Yollar arasındaki bordür yayları / adacık kenarları)
+            for junc in junction_polys:
+                if (junc["max_x"] < view_min_x or junc["min_x"] > view_max_x or
+                    junc["max_y"] < view_min_y or junc["min_y"] > view_max_y):
+                    continue
+                for p1, p2 in junc["curbs"]:
+                    scr_p1 = to_screen([p1])[0]
+                    scr_p2 = to_screen([p2])[0]
+                    pygame.draw.line(screen, junc["border_color"], scr_p1, scr_p2, 1)
+
+            # Taper bordürleri ve merkez sarı çizgisi
+            for taper in tapers:
+                if (taper["max_x"] < view_min_x or taper["min_x"] > view_max_x or
+                    taper["max_y"] < view_min_y or taper["min_y"] > view_max_y):
+                    continue
+                scr_left = to_screen(taper["left"])
+                scr_right = to_screen(taper["right"])
+                pygame.draw.line(screen, taper["border_color"], scr_left[0], scr_left[1], 1)
+                pygame.draw.line(screen, taper["border_color"], scr_right[0], scr_right[1], 1)
+
+                if taper.get("is_center"):
+                    scr_c = to_screen(taper["center_pts"])
+                    outer_w, inner_w = max(4, int(0.7 * px_per_meter)), max(2, int(0.25 * px_per_meter))
+                    pygame.draw.lines(screen, (235, 185, 30), False, scr_c, outer_w)
+                    pygame.draw.lines(screen, taper["asphalt_color"], False, scr_c, inner_w)
+
+            # Yol bordürleri ve iç şeritler
+            for road in roads:
+                if (road["max_x"] < view_min_x or road["min_x"] > view_max_x or
+                    road["max_y"] < view_min_y or road["min_y"] > view_max_y):
+                    continue
+
+                is_tunnel = road.get("is_tunnel", False)
+                is_unpaved = road.get("is_unpaved", False)
+                asphalt_color = (130, 115, 95) if is_unpaved else ((20, 22, 24) if is_tunnel else (55, 58, 64))
+                border_color = (100, 85, 65) if is_unpaved else ((40, 45, 50) if is_tunnel else (100, 105, 115))
+
                 if len(road["left"]) >= 2: pygame.draw.lines(screen, border_color, False, to_screen(road["left"]), 1)
                 if len(road["right"]) >= 2: pygame.draw.lines(screen, border_color, False, to_screen(road["right"]), 1)
 
@@ -446,25 +681,30 @@ def main():
                             pygame.draw.lines(screen, asphalt_color, False, scr_div, inner_w)
                         else:
                             c_color = (80, 85, 90) if is_tunnel else (200, 205, 210)
-                            dash_px, space_px, l_width = max(4.0, 3.0 * px_per_meter), max(4.0, 3.0 * px_per_meter), max(1, int(0.15 * px_per_meter))
+                            dash_px = max(4.0, 3.0 * px_per_meter)
+                            space_px = max(4.0, 3.0 * px_per_meter)
+                            l_width = max(1, int(0.15 * px_per_meter))
                             draw_dashed_polyline(screen, c_color, scr_div, dash_px, space_px, l_width)
-            # --- 5. YAYA GEÇİTLERİ (Zebra Crossings - Sadece çok yakından görünür) ---
-            if zoom > 15.0:
+
+        # 6. Yaya Geçitleri
+        if zoom > 15.0:
+            for road in roads:
+                if (road["max_x"] < view_min_x or road["min_x"] > view_max_x or
+                    road["max_y"] < view_min_y or road["min_y"] > view_max_y):
+                    continue
+                scaled_width = road["width"] * zoom
                 for cx in road.get("crossings", []):
-                    # Ekran koordinatına çevir
                     scr_pt = to_screen([cx["pt"]])[0]
-                    # Yaya geçidi fonksiyonunu çağır
                     draw_zebra_crossing(screen, scr_pt, cx["dir"][0], cx["dir"][1], scaled_width, px_per_meter)
 
         # Bilgi Ekranı
         font = pygame.font.SysFont("Consolas", 14)
-        screen.blit(font.render(f"FPS: {clock.get_fps():.1f} | Zoom: {zoom:.2f} | Yol: {roads_drawn} | Bina: {buildings_drawn}", True, (255, 255, 255)), (10, 10))
-        screen.blit(font.render("Turuncu: Sanayi/Is Yeri | Acik Gri: Yerlesim/Konut", True, (190, 110, 50)), (10, 30))
+        screen.blit(font.render(f"FPS: {clock.get_fps():.1f} | Zoom: {zoom:.2f} | Yol: {roads_drawn} | Kavşak: {len(junction_polys)}", True, (255, 255, 255)), (10, 10))
+        screen.blit(font.render("Y-Kavşak & Çatallanma Geometrisi Düzeltildi", True, (100, 220, 120)), (10, 30))
 
         pygame.display.flip()
         clock.tick(FPS)
 
     pygame.quit()
-
 if __name__ == "__main__":
     main()
