@@ -6,17 +6,14 @@ import requests
 import pygame
 
 # --- AYARLAR ---
-# Ankara 50x50 km (2500 km2)
 BBOX = [39.6950, 32.5600, 40.1450, 33.1480] 
 SCREEN_WIDTH = 1500
 SCREEN_HEIGHT = 700
 FPS = 60
 
-# Haritayı kaç parçaya böleceğiz? (4x4 = 16 Parça)
 GRID_SIZE = 4 
 CACHE_DIR = "ankara_chunks"
 
-# Klasör yoksa oluştur
 if not os.path.exists(CACHE_DIR):
     os.makedirs(CACHE_DIR)
 
@@ -43,9 +40,7 @@ def fetch_osm_chunks(bbox, grid_size):
             filename = os.path.join(CACHE_DIR, f"chunk_{i}_{j}.json")
             chunk_files.append(filename)
             
-            # Eğer parça zaten indirilmişse atla
             if os.path.exists(filename):
-                print(f"[CACHE] Parça {current_chunk}/{total_chunks} diskten okundu: {filename}")
                 current_chunk += 1
                 continue
                 
@@ -56,11 +51,9 @@ def fetch_osm_chunks(bbox, grid_size):
             );
             out body;
             >;
-            out body qt;""" # <-- skel yerine body yapıldı
+            out body qt;"""
 
             print(f"[AG] İndiriliyor: Parça {current_chunk}/{total_chunks}...")
-            
-            # Ban yememek için kararlı sunucu kullanımı
             url = "https://lz4.overpass-api.de/api/interpreter"
             success = False
             
@@ -71,23 +64,19 @@ def fetch_osm_chunks(bbox, grid_size):
                         with open(filename, "w", encoding="utf-8") as f:
                             json.dump(resp.json(), f)
                         success = True
-                        print(f"[BAŞARILI] Kaydedildi. (Sunucuyu dinlendirmek için 10 sn bekleniyor...)")
-                        time.sleep(10) # Overpass sunucusunu yormamak için zorunlu bekleme
+                        time.sleep(10)
                     elif resp.status_code == 429:
-                        print("[UYARI] Çok fazla istek! 30 saniye bekleniyor...")
                         time.sleep(30)
                     else:
-                        print(f"[HATA] HTTP {resp.status_code}. 5 sn sonra tekrar denenecek.")
                         time.sleep(5)
-                except Exception as e:
-                    print(f"[BAĞLANTI HATASI] {e}, 5 sn sonra tekrar denenecek...")
+                except Exception:
                     time.sleep(5)
                     
             current_chunk += 1
             
     return chunk_files
 
-# --- PROJEKSİYON (Değişmedi) ---
+# --- PROJEKSİYON ---
 class MapProjector:
     def __init__(self, bbox, width, height, padding=40):
         self.width = width
@@ -120,7 +109,7 @@ class MapProjector:
         draw_h = self.height - 2 * self.padding
         return (self.padding + norm_x * draw_w, self.padding + norm_y * draw_h)
 
-# --- GEOMETRİ ---
+# --- GEOMETRİ YARDIMCILARI ---
 def get_segment_normal(p1, p2):
     dx, dy = p2[0] - p1[0], p2[1] - p1[1]
     length = math.hypot(dx, dy)
@@ -152,92 +141,103 @@ def draw_dashed_polyline(surface, color, points, dash_len, space_len, width=1):
             end = min(curr + dash_len, seg_dist)
             pygame.draw.line(surface, color, (p1[0] + ux * curr, p1[1] + uy * curr), (p1[0] + ux * end, p1[1] + uy * end), width)
             curr += dash_len + space_len
+
 def draw_zebra_crossing(surface, scr_pt, ux, uy, road_width_px, px_per_meter):
-    # Yolun gidiş yönüne (ux, uy) 90 derece dik olan normal vektörünü bul (nx, ny)
     nx, ny = -uy, ux
-    
-    # Zebra şeritlerinin boyutları (Dünya standartlarında ~3m uzunluk, 0.5m genişlik)
     stripe_len = max(2, int(3.0 * px_per_meter))
     stripe_w = max(1, int(0.5 * px_per_meter))
     gap_w = max(1, int(0.5 * px_per_meter))
 
-    # Çizime yolun bir kenarından başla
     half_w = road_width_px / 2.0
     start_x = scr_pt[0] - nx * half_w
     start_y = scr_pt[1] - ny * half_w
 
     curr = 0
-    # Yolun genişliği boyunca şeritleri aralıklarla diz
     while curr < road_width_px:
         c_x = start_x + nx * curr
         c_y = start_y + ny * curr
-
-        s_x1 = c_x - ux * (stripe_len / 2)
-        s_y1 = c_y - uy * (stripe_len / 2)
-        s_x2 = c_x + ux * (stripe_len / 2)
-        s_y2 = c_y + uy * (stripe_len / 2)
-
+        s_x1, s_y1 = c_x - ux * (stripe_len / 2), c_y - uy * (stripe_len / 2)
+        s_x2, s_y2 = c_x + ux * (stripe_len / 2), c_y + uy * (stripe_len / 2)
         pygame.draw.line(surface, (230, 235, 240), (s_x1, s_y1), (s_x2, s_y2), stripe_w)
         curr += (stripe_w + gap_w)
+
+def draw_lane_arrow(surface, scr_pt, ux, uy, size_px, color=(240, 240, 245)):
+    nx, ny = -uy, ux
+    tip = (scr_pt[0] + ux * size_px, scr_pt[1] + uy * size_px)
+    left = (scr_pt[0] - ux * (size_px * 0.4) + nx * (size_px * 0.45),
+            scr_pt[1] - uy * (size_px * 0.4) + ny * (size_px * 0.45))
+    right = (scr_pt[0] - ux * (size_px * 0.4) - nx * (size_px * 0.45),
+             scr_pt[1] - uy * (size_px * 0.4) - ny * (size_px * 0.45))
+    notch = (scr_pt[0] - ux * (size_px * 0.1), scr_pt[1] - uy * (size_px * 0.1))
+    pygame.draw.polygon(surface, color, [tip, left, notch, right])
+
 def get_int(val, default=0):
     try: return int(val)
     except (TypeError, ValueError): return default
 
-# --- GEOMETRİK YUMUŞATMA, KAVŞAK (Y-JUNCTION) VE TAPER MOTORU ---
+# --- GEOMETRİK YUMUŞATMA, KAVŞAK VE TAPER MOTORU ---
 def generate_junctions_and_tapers(raw_roads, projector):
     node_to_roads = {}
     for idx, r in enumerate(raw_roads):
         n_start = r["nodes"][0]
         n_end = r["nodes"][-1]
-        node_to_roads.setdefault(n_start, []).append((idx, True))   # True: Başlangıç
-        node_to_roads.setdefault(n_end, []).append((idx, False))  # False: Bitiş
+        node_to_roads.setdefault(n_start, []).append((idx, True))
+        node_to_roads.setdefault(n_end, []).append((idx, False))
 
     taper_plans = []
     junction_polys = []
 
     for nid, conns in node_to_roads.items():
-        # =========================================================================
-        # 1. DURUM: 3 veya Daha Fazla Yolun Birleştiği Kavşaklar (Y-Kavşak, Çatallanma)
-        # =========================================================================
+        # 1. DURUM: 3 veya Daha Fazla Yolun Birleştiği Kavşaklar
         if len(conns) >= 3:
-            # Düğüm noktasının koordinatını al
+            # DÜZELTME: Dönel kavşak çemberlerini parçalama! Sadece bağlanan yan kolları geri çek.
+            has_roundabout = any(raw_roads[idx].get("is_roundabout") for idx, _ in conns)
+            if has_roundabout:
+                max_w_at_node = max(raw_roads[idx]["width"] for idx, _ in conns)
+                for idx, is_start in conns:
+                    r = raw_roads[idx]
+                    if r.get("is_roundabout"):
+                        continue
+                    pts = r["points"]
+                    if len(pts) < 2: continue
+                    p_curr = pts[0] if is_start else pts[-1]
+                    p_next = pts[1] if is_start else pts[-2]
+                    dx, dy = p_next[0] - p_curr[0], p_next[1] - p_curr[1]
+                    seg_len = math.hypot(dx, dy)
+                    if seg_len < 1e-4: continue
+                    ux, uy = dx / seg_len, dy / seg_len
+                    setback = min(max_w_at_node * 0.5, seg_len * 0.4)
+                    p_cut = (p_curr[0] + ux * setback, p_curr[1] + uy * setback)
+                    if is_start: pts[0] = p_cut
+                    else: pts[-1] = p_cut
+                continue
+
             idx0, is_s0 = conns[0]
             p_node = raw_roads[idx0]["points"][0] if is_s0 else raw_roads[idx0]["points"][-1]
-
             max_w_at_node = max(raw_roads[idx]["width"] for idx, _ in conns)
             mouth_corners = []
 
-            # Her yolu kavşak merkezinden dışarıya doğru geri çek (Setback)
             for idx, is_start in conns:
                 r = raw_roads[idx]
                 pts = r["points"]
-                if len(pts) < 2:
-                    continue
+                if len(pts) < 2: continue
 
                 p_curr = pts[0] if is_start else pts[-1]
                 p_next = pts[1] if is_start else pts[-2]
 
-                dx = p_next[0] - p_curr[0]
-                dy = p_next[1] - p_curr[1]
+                dx, dy = p_next[0] - p_curr[0], p_next[1] - p_curr[1]
                 seg_len = math.hypot(dx, dy)
-                if seg_len < 1e-4:
-                    continue
+                if seg_len < 1e-4: continue
 
                 ux, uy = dx / seg_len, dy / seg_len
-                # Geri çekilme mesafesi (Yolun genişliğine ve kavşaktaki en geniş yola orantılı)
                 setback = min(max(r["width"] * 0.75, max_w_at_node * 0.5), seg_len * 0.42)
-
                 p_cut = (p_curr[0] + ux * setback, p_curr[1] + uy * setback)
 
-                # Yolun uç noktasını geri çekilmiş noktaya sabitle (Şeritler kavşağa taşmaz!)
-                if is_start:
-                    pts[0] = p_cut
-                else:
-                    pts[-1] = p_cut
+                if is_start: pts[0] = p_cut
+                else: pts[-1] = p_cut
 
-                # Yol ağzındaki sol ve sağ köşe noktalarını hesapla
                 half_w = r["width"] / 2.0
-                nx, ny = -uy, ux  # Gidiş yönüne dik normal vektör
+                nx, ny = -uy, ux
 
                 p_left = (p_cut[0] - nx * half_w, p_cut[1] - ny * half_w)
                 p_right = (p_cut[0] + nx * half_w, p_cut[1] + ny * half_w)
@@ -246,16 +246,12 @@ def generate_junctions_and_tapers(raw_roads, projector):
                 mouth_corners.append({"pt": p_right, "road_idx": idx, "side": "right"})
 
             if len(mouth_corners) >= 6:
-                # Köşeleri kavşak merkezine göre açısal (saat yönünde) sırala
                 def get_angle(c):
                     return math.atan2(c["pt"][1] - p_node[1], c["pt"][0] - p_node[0])
 
                 sorted_corners = sorted(mouth_corners, key=get_angle)
                 poly_pts = [c["pt"] for c in sorted_corners]
 
-                # Kaldırım/Bordür kenarlarını belirle:
-                # İki nokta AYNI yola aitse orası yolun açık ağzıdır (çizgi çekilmez).
-                # İki nokta FARKLI yollara aitse orası iki yol arasındaki kaldırımdır (çizgi çekilir).
                 curb_lines = []
                 n_pts = len(sorted_corners)
                 for i in range(n_pts):
@@ -273,17 +269,13 @@ def generate_junctions_and_tapers(raw_roads, projector):
                 border_color = (100, 85, 65) if is_unpaved else ((40, 45, 50) if is_tunnel else (100, 105, 115))
 
                 junction_polys.append({
-                    "poly": poly_pts,
-                    "curbs": curb_lines,
-                    "asphalt_color": asphalt_color,
-                    "border_color": border_color,
+                    "poly": poly_pts, "curbs": curb_lines,
+                    "asphalt_color": asphalt_color, "border_color": border_color,
                     "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
                 })
             continue
 
-        # =========================================================================
-        # 2. DURUM: 2 Yol Arasındaki Şerit Değişimi (Taper - Konik Genişleme)
-        # =========================================================================
+        # 2. DURUM: 2 Yol Arasındaki Şerit Değişimi (Taper)
         if len(conns) == 2:
             (idx1, is_start1), (idx2, is_start2) = conns
             r1, r2 = raw_roads[idx1], raw_roads[idx2]
@@ -295,26 +287,21 @@ def generate_junctions_and_tapers(raw_roads, projector):
                     r_wide, is_start_w, r_narrow, is_start_n = r2, is_start2, r1, is_start1
 
                 pts_w = r_wide["points"]
-                if len(pts_w) < 2:
-                    continue
+                if len(pts_w) < 2: continue
 
                 p_junc = pts_w[0] if is_start_w else pts_w[-1]
                 p_next = pts_w[1] if is_start_w else pts_w[-2]
 
-                dx = p_next[0] - p_junc[0]
-                dy = p_next[1] - p_junc[1]
+                dx, dy = p_next[0] - p_junc[0], p_next[1] - p_junc[1]
                 seg_len = math.hypot(dx, dy)
-                if seg_len < 1e-4:
-                    continue
+                if seg_len < 1e-4: continue
 
                 ux, uy = dx / seg_len, dy / seg_len
                 taper_dist = min(20.0 * projector.units_per_meter, seg_len * 0.45)
                 p_taper = (p_junc[0] + ux * taper_dist, p_junc[1] + uy * taper_dist)
 
-                if is_start_w:
-                    pts_w[0] = p_taper
-                else:
-                    pts_w[-1] = p_taper
+                if is_start_w: pts_w[0] = p_taper
+                else: pts_w[-1] = p_taper
 
                 taper_plans.append({
                     "r_wide": r_wide, "is_start_w": is_start_w,
@@ -324,12 +311,12 @@ def generate_junctions_and_tapers(raw_roads, projector):
 
     return taper_plans, junction_polys
 
-
-# --- GÜNCELLENMİŞ PARÇALI VERİ AYRIŞTIRICI ---
+# --- PARÇALI VERİ AYRIŞTIRICI ---
 def parse_osm_chunks(chunk_files, projector):
     print("[SİSTEM] Tüm parçalar birleştiriliyor ve işleniyor...")
     raw_roads = []
     buildings = []
+    roundabout_islands = []
     seen_ways = set()
     crossings = set()
 
@@ -339,28 +326,23 @@ def parse_osm_chunks(chunk_files, projector):
 
         nodes = {elem["id"]: (elem["lat"], elem["lon"]) for elem in data.get("elements", []) if elem["type"] == "node"}
 
-        # 1. Yaya Geçitlerini Topla
         for elem in data.get("elements", []):
             if elem["type"] == "node" and elem.get("tags", {}).get("highway") == "crossing":
                 crossings.add(elem["id"])
 
-        # 2. Yolları ve Binaları Oku
         for elem in data.get("elements", []):
             if elem["type"] == "way":
                 way_id = elem["id"]
-                if way_id in seen_ways:
-                    continue
+                if way_id in seen_ways: continue
                 seen_ways.add(way_id)
 
                 tags = elem.get("tags", {})
                 points = [projector.project(*nodes[nid]) for nid in elem.get("nodes", []) if nid in nodes]
-                if len(points) < 2:
-                    continue
+                if len(points) < 2: continue
 
                 xs = [p[0] for p in points]
                 ys = [p[1] for p in points]
 
-                # BİNA İŞLEME
                 if "building" in tags:
                     if len(points) >= 3:
                         b_type = tags.get("building", "yes")
@@ -380,17 +362,19 @@ def parse_osm_chunks(chunk_files, projector):
                             "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
                         })
 
-                # YOL İŞLEME
                 elif "highway" in tags:
                     hw_type = tags.get("highway")
                     if hw_type in ["footway", "pedestrian", "path", "steps", "cycleway"]:
                         continue
 
+                    # DÜZELTME: is_oneway dönel kavşaklar için garantiye alındı
+                    is_roundabout = tags.get("junction") in ["roundabout", "circular"]
+                    is_oneway = (tags.get("oneway") in ["yes", "1", "true"]) or is_roundabout
+
                     surface = tags.get("surface", "unknown")
                     unpaved_surfaces = ["dirt", "unpaved", "gravel", "earth", "ground", "sand", "grass", "mud", "compacted"]
                     is_unpaved = (hw_type == "track") or (surface in unpaved_surfaces)
 
-                    is_oneway = tags.get("oneway") in ["yes", "1", "true"]
                     lanes = get_int(tags.get("lanes:forward", 0)) + get_int(tags.get("lanes:backward", 0))
                     if lanes == 0:
                         lanes = get_int(tags.get("lanes", 0))
@@ -406,6 +390,21 @@ def parse_osm_chunks(chunk_files, projector):
                     world_lane_w = (2.5 if is_unpaved else 3.5) * projector.units_per_meter
                     total_w = lanes * world_lane_w
 
+                    # Yön okları hesabı
+                    arrow_anchors = []
+                    if is_roundabout and len(points) >= 2:
+                        accum_dist = 0.0
+                        arrow_interval = 18.0 * projector.units_per_meter
+                        for i in range(len(points) - 1):
+                            p1, p2 = points[i], points[i + 1]
+                            d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+                            if d == 0: continue
+                            accum_dist += d
+                            if accum_dist >= arrow_interval:
+                                accum_dist = 0.0
+                                ux, uy = (p2[0] - p1[0]) / d, (p2[1] - p1[1]) / d
+                                arrow_anchors.append({"pt": p2, "dir": (ux, uy)})
+
                     raw_roads.append({
                         "points": points,
                         "nodes": elem.get("nodes", []),
@@ -417,14 +416,17 @@ def parse_osm_chunks(chunk_files, projector):
                         "is_bridge": is_bridge,
                         "is_tunnel": is_tunnel,
                         "is_unpaved": is_unpaved,
-                        "z_index": z_index
+                        "z_index": z_index,
+                        "arrows": arrow_anchors,
+                        "is_roundabout": is_roundabout
                     })
 
-    # --- KAVŞAK VE TAPERLAR HESAPLANIYOR (Uçlar düzeltiliyor) ---
     taper_plans, junction_polys = generate_junctions_and_tapers(raw_roads, projector)
 
-    # 3. Yolların Bordür ve Şeritlerini Hesapla (Trimlenmiş noktalar üzerinden!)
+    # 3. Bordür, Şerit ve Ada Geometrileri
     roads = []
+    rb_segments = []
+
     for r in raw_roads:
         pts = r["points"]
         total_w = r["width"]
@@ -435,8 +437,21 @@ def parse_osm_chunks(chunk_files, projector):
         left_border = offset_polyline(pts, -half_w)
         right_border = offset_polyline(pts, half_w)
 
+        # DÜZELTME: Dönel kavşak adası artık burada (left_border tanımlıyken) hesaplanıyor
+        if r.get("is_roundabout") and len(pts) >= 3:
+            node_ids = r["nodes"]
+            if len(node_ids) >= 2 and node_ids[0] == node_ids[-1]:
+                island_poly = left_border[:-1]
+                ixs, iys = [p[0] for p in island_poly], [p[1] for p in island_poly]
+                roundabout_islands.append({
+                    "poly": island_poly,
+                    "min_x": min(ixs), "max_x": max(ixs), "min_y": min(iys), "max_y": max(iys)
+                })
+            else:
+                rb_segments.append({"start": node_ids[0], "end": node_ids[-1], "pts": left_border})
+
         dividers = []
-        if lanes > 1 and not r["is_unpaved"]:
+        if lanes > 1 and not r["is_unpaved"] and not r.get("is_roundabout"):
             for lane_idx in range(1, lanes):
                 offset = -half_w + (lane_idx * world_lane_w)
                 div_pts = offset_polyline(pts, offset)
@@ -447,18 +462,14 @@ def parse_osm_chunks(chunk_files, projector):
                         elif lanes % 2 != 0 and lane_idx == lanes // 2: is_center = True
                     dividers.append({"pts": div_pts, "is_center": is_center})
 
-        # Yaya geçitleri
         road_crossings = []
         node_ids = r["nodes"]
         for i, nid in enumerate(node_ids):
             if nid in crossings and i < len(pts):
                 p_curr = pts[i]
-                if i < len(pts) - 1:
-                    dx, dy = pts[i+1][0] - p_curr[0], pts[i+1][1] - p_curr[1]
-                elif i > 0:
-                    dx, dy = p_curr[0] - pts[i-1][0], p_curr[1] - pts[i-1][1]
-                else:
-                    dx, dy = 1, 0
+                if i < len(pts) - 1: dx, dy = pts[i+1][0] - p_curr[0], pts[i+1][1] - p_curr[1]
+                elif i > 0: dx, dy = p_curr[0] - pts[i-1][0], p_curr[1] - pts[i-1][1]
+                else: dx, dy = 1, 0
                 length = math.hypot(dx, dy)
                 if length > 0:
                     road_crossings.append({"pt": p_curr, "dir": (dx/length, dy/length)})
@@ -473,7 +484,31 @@ def parse_osm_chunks(chunk_files, projector):
         })
         roads.append(r)
 
-    # 4. Taper Geometrilerini Bordür Noktalarına Mühürle
+    # Çok parçalı dönel kavşak adalarını birleştir
+    visited = set()
+    for i, seg in enumerate(rb_segments):
+        if i in visited: continue
+        chain = list(seg["pts"])
+        visited.add(i)
+        curr_end, start_node = seg["end"], seg["start"]
+        while True:
+            found = False
+            for j, other in enumerate(rb_segments):
+                if j not in visited and other["start"] == curr_end:
+                    visited.add(j)
+                    chain.extend(other["pts"][1:])
+                    curr_end = other["end"]
+                    found = True
+                    break
+            if not found or curr_end == start_node: break
+        if curr_end == start_node and len(chain) >= 3:
+            ixs, iys = [p[0] for p in chain], [p[1] for p in chain]
+            roundabout_islands.append({
+                "poly": chain,
+                "min_x": min(ixs), "max_x": max(ixs), "min_y": min(iys), "max_y": max(iys)
+            })
+
+    # 4. Taper Geometrileri
     tapers = []
     for plan in taper_plans:
         r_w, is_s_w = plan["r_wide"], plan["is_start_w"]
@@ -481,7 +516,6 @@ def parse_osm_chunks(chunk_files, projector):
 
         l_junc = r_n["left"][0 if is_s_n else -1]
         r_junc = r_n["right"][0 if is_s_n else -1]
-
         l_taper = r_w["left"][0 if is_s_w else -1]
         r_taper = r_w["right"][0 if is_s_w else -1]
 
@@ -496,34 +530,28 @@ def parse_osm_chunks(chunk_files, projector):
         is_unpaved = r_w.get("is_unpaved", False)
         asphalt_color = (130, 115, 95) if is_unpaved else ((20, 22, 24) if is_tunnel else (55, 58, 64))
         border_color = (100, 85, 65) if is_unpaved else ((40, 45, 50) if is_tunnel else (100, 105, 115))
-
         has_center = (not r_w.get("is_oneway", True)) and (not r_n.get("is_oneway", True))
 
         tapers.append({
-            "poly": poly,
-            "left": [l_junc, l_taper],
-            "right": [r_junc, r_taper],
-            "asphalt_color": asphalt_color,
-            "border_color": border_color,
-            "is_center": has_center,
-            "center_pts": [plan["p_junc"], plan["p_taper"]],
+            "poly": poly, "left": [l_junc, l_taper], "right": [r_junc, r_taper],
+            "asphalt_color": asphalt_color, "border_color": border_color,
+            "is_center": has_center, "center_pts": [plan["p_junc"], plan["p_taper"]],
             "min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)
         })
 
-    print(f"[SİSTEM] {len(roads)} Yol, {len(junction_polys)} Kavşak Alanı, {len(tapers)} Taper, {len(buildings)} Bina hazır.")
-    return roads, buildings, tapers, junction_polys
-
+    print(f"[SİSTEM] {len(roads)} Yol, {len(junction_polys)} Kavşak, {len(roundabout_islands)} Ada, {len(tapers)} Taper, {len(buildings)} Bina hazır.")
+    return roads, buildings, tapers, junction_polys, roundabout_islands
 
 # --- ANA ÇİZİM DÖNGÜSÜ ---
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-    pygame.display.set_caption("ANKARA HARİTA RENDERER (Pürüzsüz Kavşaklar & Çatallanmalar)")
+    pygame.display.set_caption("ANKARA HARİTA RENDERER (Dönel Kavşaklar ve Pürüzsüz Geometri)")
     clock = pygame.time.Clock()
 
     projector = MapProjector(BBOX, SCREEN_WIDTH, SCREEN_HEIGHT)
     chunk_files = fetch_osm_chunks(BBOX, GRID_SIZE)
-    roads, buildings, tapers, junction_polys = parse_osm_chunks(chunk_files, projector)
+    roads, buildings, tapers, junction_polys, roundabout_islands = parse_osm_chunks(chunk_files, projector)
     roads.sort(key=lambda r: (r.get("z_index", 0), r["lanes"]))
 
     camera_x, camera_y, zoom = 0.0, 0.0, 1.0
@@ -572,13 +600,9 @@ def main():
                     continue
                 scr_pts = to_screen(b["points"])
                 if len(scr_pts) > 2:
-                    if b["category"] == "industrial":
-                        color, border = (190, 110, 50), (130, 70, 30)
-                    elif b["category"] == "residential":
-                        color, border = (180, 185, 180), (120, 125, 120)
-                    else:
-                        color, border = (80, 85, 90), (50, 55, 60)
-
+                    if b["category"] == "industrial": color, border = (190, 110, 50), (130, 70, 30)
+                    elif b["category"] == "residential": color, border = (180, 185, 180), (120, 125, 120)
+                    else: color, border = (80, 85, 90), (50, 55, 60)
                     pygame.draw.polygon(screen, color, scr_pts)
                     pygame.draw.polygon(screen, border, scr_pts, max(1, int(0.2 * px_per_meter)))
 
@@ -612,8 +636,7 @@ def main():
 
             scaled_width = road["width"] * zoom
             scr_body = to_screen(road["body"])
-            if len(scr_body) < 2:
-                continue
+            if len(scr_body) < 2: continue
 
             is_bridge = road.get("is_bridge", False)
             is_tunnel = road.get("is_tunnel", False)
@@ -629,9 +652,18 @@ def main():
 
             pygame.draw.lines(screen, asphalt_color, False, scr_body, max(1, int(scaled_width)))
 
-        # 5. Bordür Çizgileri ve Şeritler
+        # DÜZELTME: Dönel Kavşak Merkez Adaları (Asfaltın ÜZERİNE çizilerek bordür korunuyor)
+        for island in roundabout_islands:
+            if (island["max_x"] < view_min_x or island["min_x"] > view_max_x or
+                island["max_y"] < view_min_y or island["min_y"] > view_max_y):
+                continue
+            scr_island = to_screen(island["poly"])
+            if len(scr_island) >= 3:
+                pygame.draw.polygon(screen, (40, 95, 50), scr_island)
+                pygame.draw.polygon(screen, (160, 165, 170), scr_island, max(1, int(0.3 * px_per_meter)))
+
+        # 5. Bordür Çizgileri, Şeritler ve Yön Okları
         if zoom > 5.0:
-            # Kavşak Bordürleri (Yollar arasındaki bordür yayları / adacık kenarları)
             for junc in junction_polys:
                 if (junc["max_x"] < view_min_x or junc["min_x"] > view_max_x or
                     junc["max_y"] < view_min_y or junc["min_y"] > view_max_y):
@@ -641,7 +673,6 @@ def main():
                     scr_p2 = to_screen([p2])[0]
                     pygame.draw.line(screen, junc["border_color"], scr_p1, scr_p2, 1)
 
-            # Taper bordürleri ve merkez sarı çizgisi
             for taper in tapers:
                 if (taper["max_x"] < view_min_x or taper["min_x"] > view_max_x or
                     taper["max_y"] < view_min_y or taper["min_y"] > view_max_y):
@@ -657,7 +688,6 @@ def main():
                     pygame.draw.lines(screen, (235, 185, 30), False, scr_c, outer_w)
                     pygame.draw.lines(screen, taper["asphalt_color"], False, scr_c, inner_w)
 
-            # Yol bordürleri ve iç şeritler
             for road in roads:
                 if (road["max_x"] < view_min_x or road["min_x"] > view_max_x or
                     road["max_y"] < view_min_y or road["min_y"] > view_max_y):
@@ -671,6 +701,7 @@ def main():
                 if len(road["left"]) >= 2: pygame.draw.lines(screen, border_color, False, to_screen(road["left"]), 1)
                 if len(road["right"]) >= 2: pygame.draw.lines(screen, border_color, False, to_screen(road["right"]), 1)
 
+                # Şerit çizgileri
                 if road["type"] not in ["residential", "unclassified", "living_street", "service"] and not is_unpaved:
                     for div in road["dividers"]:
                         scr_div = to_screen(div["pts"])
@@ -686,6 +717,13 @@ def main():
                             l_width = max(1, int(0.15 * px_per_meter))
                             draw_dashed_polyline(screen, c_color, scr_div, dash_px, space_px, l_width)
 
+                # DÜZELTME: Dönel kavşak okları artık yol tipinden bağımsız çizilir
+                if road.get("is_roundabout") and zoom > 6.0:
+                    arrow_size = max(4.0, 2.5 * px_per_meter)
+                    for arrow in road.get("arrows", []):
+                        scr_pt = to_screen([arrow["pt"]])[0]
+                        draw_lane_arrow(screen, scr_pt, arrow["dir"][0], arrow["dir"][1], arrow_size)
+
         # 6. Yaya Geçitleri
         if zoom > 15.0:
             for road in roads:
@@ -699,12 +737,13 @@ def main():
 
         # Bilgi Ekranı
         font = pygame.font.SysFont("Consolas", 14)
-        screen.blit(font.render(f"FPS: {clock.get_fps():.1f} | Zoom: {zoom:.2f} | Yol: {roads_drawn} | Kavşak: {len(junction_polys)}", True, (255, 255, 255)), (10, 10))
-        screen.blit(font.render("Y-Kavşak & Çatallanma Geometrisi Düzeltildi", True, (100, 220, 120)), (10, 30))
+        screen.blit(font.render(f"FPS: {clock.get_fps():.1f} | Zoom: {zoom:.2f} | Yol: {roads_drawn} | Kavşak: {len(junction_polys)} | Ada: {len(roundabout_islands)}", True, (255, 255, 255)), (10, 10))
+        screen.blit(font.render("Dönel Kavşak Geometrisi & Yeşil Ada Sistemi Aktif", True, (100, 220, 120)), (10, 30))
 
         pygame.display.flip()
         clock.tick(FPS)
 
     pygame.quit()
+
 if __name__ == "__main__":
     main()
