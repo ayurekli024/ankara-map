@@ -1,0 +1,10 @@
+# Ignore large generated map data and archives
+ankara_chunks/
+ankara_chunks/**
+newyork_chunks/
+newyork_chunks/**
+*.zip
+
+# keep local Python env out of git
+.venv/
+__pycache__/
